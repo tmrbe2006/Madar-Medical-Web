@@ -1,0 +1,50 @@
+import { RuleError, text } from './core.js';
+const protectedIds = ['1', '2', '3', '4', '5', '1100', '1200', '1210', '1300', '1500', '2100', '2200', '2300', '3000', '4000', '4090', '5000', '5100', '5200'];
+export async function saveAccount(c, u, d) {
+    const old = d.id ? await c.one('SELECT * FROM accounts WHERE id=?', [text(d.id, 64)]) : undefined;
+    if (d.id && !old)
+        throw new RuleError('Account missing');
+    await c.admin.check(u, 'accounting', d.remove === true ? 'delete' : old ? 'edit' : 'add');
+    const used = old && await c.one('SELECT id FROM journal_lines WHERE account_id=?', [old.id]), children = old && await c.one('SELECT id FROM accounts WHERE parent_id=?', [old.id]);
+    if (d.remove === true) {
+        if (!old || protectedIds.includes(old.id) || used || children)
+            throw new RuleError('Cannot delete a system account, account with children or posted entries / لا يمكن حذف حساب نظامي أو مرتبط بفروع أو قيود');
+        await c.db.run('DELETE FROM accounts WHERE id=?', [old.id]);
+        await c.audit(u, 'DELETE_ACCOUNT', old.id, '');
+        return { id: old.id };
+    }
+    const name = text(d.name, 200).trim(), parent_id = old ? old.parent_id : text(d.parent_id, 64), parent = await c.one('SELECT * FROM accounts WHERE id=?', [parent_id]);
+    if (!name || (!old && (!parent || parent.postable)))
+        throw new RuleError('Choose an active group parent and account name');
+    if (old && d.parent_id !== undefined && d.parent_id !== old.parent_id)
+        throw new RuleError('Parent is fixed to preserve account code hierarchy');
+    const postable = d.group ? 0 : 1;
+    if (old && (protectedIds.includes(old.id) || used || children) && postable !== old.postable)
+        throw new RuleError('Account type cannot change after use or while it has children');
+    let id = old?.id || '';
+    if (!old) {
+        const key = 'account:' + parent_id, row = await c.one('SELECT value FROM code_sequences WHERE id=?', [key]);
+        let n = Number(row?.value || 0);
+        for (const a of await c.db.all('SELECT * FROM accounts WHERE parent_id=?', [parent_id]))
+            if (a.id.startsWith(parent_id) && /^\d+$/.test(a.id.slice(parent_id.length)))
+                n = Math.max(n, Number(a.id.slice(parent_id.length)));
+        do {
+            n++;
+            id = parent_id + String(n).padStart(3, '0');
+        } while (await c.one('SELECT id FROM accounts WHERE id=?', [id]) || await c.one('SELECT id FROM code_registry WHERE id=?', ['ACC:' + id]));
+        if (id.length > 20 || !Number.isSafeInteger(n))
+            throw new RuleError('Maximum account depth reached');
+        if (row)
+            await c.db.run('UPDATE code_sequences SET value=? WHERE id=?', [n, key]);
+        else
+            await c.db.insert('code_sequences', { id: key, value: n });
+        await c.db.insert('code_registry', { id: 'ACC:' + id, owner_id: id });
+    }
+    const a = { id, name, parent_id, category: old?.category || parent.category, postable };
+    if (old)
+        await c.db.run('UPDATE accounts SET name=?,postable=? WHERE id=?', [name, postable, id]);
+    else
+        await c.db.insert('accounts', a);
+    await c.audit(u, old ? 'UPDATE_ACCOUNT' : 'CREATE_ACCOUNT', id, '');
+    return a;
+}

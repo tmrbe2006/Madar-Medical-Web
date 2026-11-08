@@ -1,0 +1,399 @@
+import { seedPublishedReferences } from './reference-data.js';
+import { RuleError, text, uid, now, pack, businessDate, cents } from './core.js';
+import { ageYears } from '../shared/workflow.js';
+export const catalogKinds = ['specialties', 'diagnoses', 'medicines', 'lab_tests', 'radiology_tests', 'referral_sources', 'insurance_companies', 'doses', 'routes', 'frequencies', 'durations'];
+const dateValid = (s) => /^\d{4}-\d{2}-\d{2}$/.test(s) && Number.isFinite(Date.parse(s)) && new Date(s).toISOString().slice(0, 10) === s;
+export class Workflow {
+    c;
+    constructor(c) {
+        this.c = c;
+    }
+    async ensure() {
+        await this.prescriptionSeeds();
+        if (await this.c.one('SELECT id FROM settings WHERE id=?', ['workflow-v1']))
+            return;
+        const seeds = {
+            specialties: [['SP_GENERAL', 'الطب العام / General practice', 'GEN', ''], ['SP_INTERNAL', 'الباطنة / Internal medicine', 'INT', ''], ['SP_CHILD', 'الأطفال / Pediatrics', 'PED', ''], ['SP_SURGERY', 'الجراحة / Surgery', 'SUR', '']],
+            referral_sources: [['REF_FB', 'Facebook', 'FB', ''], ['REF_IG', 'Instagram', 'IG', ''], ['REF_TT', 'TikTok', 'TT', ''], ['REF_GOOGLE', 'Google', 'GOOGLE', ''], ['REF_WA', 'WhatsApp', 'WA', ''], ['REF_FRIEND', 'ترشيح شخص / Personal recommendation', 'FRIEND', ''], ['REF_DOCTOR', 'تحويل طبيب / Doctor referral', 'DOCTOR', ''], ['REF_OTHER', 'أخرى / Other', 'OTHER', '']],
+            insurance_companies: [['INS_A', 'شركة أ — نموذج / Company A — sample', 'A', ''], ['INS_B', 'شركة ب — نموذج / Company B — sample', 'B', '']],
+            lab_tests: [['LAB_CBC', 'صورة دم كاملة / Complete blood count', 'CBC', 'S3']],
+            radiology_tests: [['RAD_CHEST', 'أشعة صدر / Chest X-ray', 'CHEST', 'S4']]
+        };
+        for (const kind of catalogKinds)
+            for (const [id, name, code, service_id] of seeds[kind] || [])
+                if (!await this.c.one(`SELECT id FROM ${kind} WHERE id=?`, [id]))
+                    await this.c.db.insert(kind, { id, name, code, service_id: service_id && await this.c.one('SELECT id FROM services WHERE id=?', [service_id]) ? service_id : '', active: 1 });
+        for (const b of await this.c.db.all('SELECT id FROM branches'))
+            if (!await this.c.one('SELECT id FROM clinics WHERE id=?', ['CL_' + b.id]))
+                await this.c.db.insert('clinics', { id: 'CL_' + b.id, branch_id: b.id, name: 'عيادة عامة — نموذج / General clinic — sample', specialty_id: 'SP_GENERAL', active: 1 });
+        for (const p of await this.c.db.all('SELECT * FROM plans')) {
+            const rules = JSON.parse(p.payload);
+            if (!rules.insurer_id && (p.id === 'P1' || p.id === 'P2')) {
+                rules.insurer_id = p.id === 'P1' ? 'INS_A' : 'INS_B';
+                rules.active = 1;
+                await this.c.db.run('UPDATE plans SET payload=? WHERE id=?', [pack(rules), p.id]);
+            }
+        }
+        await this.c.db.insert('settings', { id: 'workflow-v1', payload: pack({ version: 1, installed_at: now() }) });
+    }
+    async prescriptionSeeds() { if (await this.c.one('SELECT id FROM settings WHERE id=?', ['rx-lists-v1']))
+        return; const seeds = { doses: ['قرص واحد / One tablet', 'نصف قرص / Half tablet', 'كبسولة واحدة / One capsule', '5 مل / 5 mL', '10 مل / 10 mL', 'بخة واحدة / One puff', 'قطرة واحدة / One drop'], routes: ['عن طريق الفم / Oral', 'موضعي / Topical', 'استنشاق / Inhalation', 'قطرات عين / Ophthalmic', 'قطرات أذن / Otic', 'تحت الجلد / Subcutaneous', 'حقن عضلي / Intramuscular'], frequencies: ['مرة يوميًا / Once daily', 'مرتين يوميًا / Twice daily', 'ثلاث مرات يوميًا / Three times daily', 'عند اللزوم بتحديد الطبيب / As directed when needed'], durations: ['يوم واحد / One day', '3 أيام / 3 days', '5 أيام / 5 days', '7 أيام / 7 days', '14 يومًا / 14 days', '30 يومًا / 30 days', 'حسب مراجعة الطبيب / Until clinician review'] }; for (const [kind, names] of Object.entries(seeds))
+        for (const name of names)
+            await this.c.db.insert(kind, { id: uid(), name, code: await this.c.admin.code(kind, 'rx-list'), active: 1, service_id: '' }); await this.c.db.insert('settings', { id: 'rx-lists-v1', payload: pack({ installed_at: now() }) }); }
+    async profile(id) { return await this.c.one('SELECT * FROM patient_profiles WHERE patient_id=?', [id]) || { patient_id: id, payer_type: 'normal', insurer_id: '', plan_id: '', referral_source_id: '', referral_notes: '', deleted_at: '' }; }
+    async writeProfile(p) { if (await this.c.one('SELECT patient_id FROM patient_profiles WHERE patient_id=?', [p.patient_id]))
+        await this.c.db.run('UPDATE patient_profiles SET payer_type=?,insurer_id=?,plan_id=?,referral_source_id=?,referral_notes=?,deleted_at=? WHERE patient_id=?', [p.payer_type, p.insurer_id, p.plan_id, p.referral_source_id, p.referral_notes, p.deleted_at, p.patient_id]);
+    else
+        await this.c.db.insert('patient_profiles', p); }
+    async savePatient(u, d) {
+        await this.c.admin.check(u, 'patients', d.remove === true ? 'delete' : d.id || d.restore === true ? 'edit' : 'add');
+        const id = text(d.id, 64), old = id ? await this.c.one('SELECT * FROM patients WHERE id=?', [id]) : undefined;
+        if (id && !old)
+            throw new RuleError('Patient missing / المريض غير موجود');
+        const previous = await this.profile(id);
+        if (previous.deleted_at)
+            throw new RuleError('Restore the patient first / استعد الملف المحذوف أولًا');
+        const name = text(d.name, 200).trim(), birth_date = text(d.birth_date, 10);
+        if (!name)
+            throw new RuleError('Patient name required / اسم المريض مطلوب');
+        if (birth_date && (!dateValid(birth_date) || birth_date > businessDate()))
+            throw new RuleError('Invalid birth date / تاريخ ميلاد غير صالح');
+        const payer_type = d.payer_type ?? previous.payer_type;
+        if (payer_type !== 'normal' && payer_type !== 'insurance')
+            throw new RuleError('Invalid payer type');
+        let insurer_id = '', plan_id = '';
+        if (payer_type === 'insurance') {
+            insurer_id = text(d.insurer_id, 64);
+            plan_id = text(d.plan_id, 64);
+            const insurer = await this.c.one('SELECT * FROM insurance_companies WHERE id=?', [insurer_id]), p = await this.c.one('SELECT * FROM plans WHERE id=?', [plan_id]);
+            const rules = p ? JSON.parse(p.payload) : undefined;
+            if (!insurer || (!insurer.active && previous.insurer_id !== insurer_id) || !rules || rules.insurer_id !== insurer_id || (rules.active === 0 && previous.plan_id !== plan_id))
+                throw new RuleError('Select a valid insurance company and its plan / اختر شركة التأمين وخطة تابعة لها');
+        }
+        const referral_source_id = text(d.referral_source_id, 64);
+        if (referral_source_id && !await this.c.one('SELECT id FROM referral_sources WHERE id=?', [referral_source_id]))
+            throw new RuleError('Invalid referral source');
+        const p = { id: old?.id || uid(), name, phone: text(d.phone, 40), birth_date, allergies: old && u.role === 'reception' ? old.allergies : text(d.allergies, 4000), created_at: old?.created_at || now() };
+        if (old)
+            await this.c.db.run('UPDATE patients SET name=?,phone=?,birth_date=?,allergies=? WHERE id=?', [p.name, p.phone, p.birth_date, p.allergies, p.id]);
+        else
+            await this.c.db.insert('patients', p);
+        const profile = { patient_id: p.id, payer_type, insurer_id, plan_id, referral_source_id, referral_notes: text(d.referral_notes, 400), deleted_at: '' };
+        await this.writeProfile(profile);
+        await this.c.audit(u, old ? 'UPDATE_PATIENT' : 'CREATE_PATIENT', p.id, '');
+        return { ...p, ...profile, age_years: ageYears(p.birth_date) };
+    }
+    async deletePatient(u, d) { await this.c.admin.check(u, 'patients', 'delete'); const id = text(d.id, 64); if (!await this.c.one('SELECT id FROM patients WHERE id=?', [id]))
+        throw new RuleError('Patient missing'); if (d.restore !== true && await this.c.one('SELECT id FROM appointments WHERE patient_id=? AND (status=? OR status=?)', [id, 'booked', 'in_progress']))
+        throw new RuleError('Patient has active bookings. Cancel them first / للمريض حجوزات نشطة؛ ألغها أولًا'); const p = await this.profile(id); p.deleted_at = d.restore === true ? '' : now(); await this.writeProfile(p); await this.c.audit(u, d.restore === true ? 'RESTORE_PATIENT' : 'DELETE_PATIENT', id, ''); return { id, deleted_at: p.deleted_at }; }
+    async catalog(u, d) {
+        await this.c.admin.check(u, 'catalogs', d.remove === true ? 'delete' : d.id || d.restore === true ? 'edit' : 'add');
+        const kind = text(d.kind, 40);
+        if (!catalogKinds.includes(kind))
+            throw new RuleError('Unknown catalog');
+        const id = text(d.id, 64), old = id ? await this.c.one(`SELECT * FROM ${kind} WHERE id=?`, [id]) : undefined;
+        if (id && !old)
+            throw new RuleError('Catalog item missing');
+        if (d.remove === true || d.restore === true) {
+            if (!old)
+                throw new RuleError('Select an item');
+            const active = d.restore === true ? 1 : 0;
+            await this.c.db.run(`UPDATE ${kind} SET active=? WHERE id=?`, [active, id]);
+            await this.c.audit(u, active ? 'RESTORE_' + kind : 'DELETE_' + kind, id, '');
+            return { ...old, active };
+        }
+        const itemId = old?.id || uid();
+        const name = kind === 'lab_tests' && typeof d.name_en === 'string' ? text(d.name_en, 100).trim() + ' / ' + text(d.name_ar, 90).trim() : text(d.name, 200).trim(), code = old?.code || await this.c.admin.code(kind, itemId), service_id = ['lab_tests', 'radiology_tests'].includes(kind) ? text(d.service_id, 64) : '';
+        if (kind === 'lab_tests' && typeof d.name_en === 'string' && (!/[A-Za-z]/.test(d.name_en) || !text(d.name_ar).trim()))
+            throw new RuleError('English and Arabic test names required / أدخل اسم التحليل بالإنجليزية والعربية');
+        if (!name)
+            throw new RuleError('Name required / الاسم مطلوب');
+        const duplicate = await this.c.one(`SELECT * FROM ${kind} WHERE name=? AND active=?`, [name, 1]);
+        if (duplicate && duplicate.id !== id)
+            throw new RuleError('Name already exists / الاسم موجود بالفعل');
+        if (service_id) {
+            const service = await this.c.one('SELECT * FROM services WHERE id=?', [service_id]);
+            if (!service || (await this.c.one('SELECT active FROM service_details WHERE id=?', [service_id]))?.active === 0 || service.category !== (kind === 'lab_tests' ? 'lab' : 'radiology'))
+                throw new RuleError('Service category does not match / نوع الخدمة لا يطابق القائمة');
+        }
+        const item = { id: itemId, name, code, service_id, active: old?.active ?? 1 };
+        if (old)
+            await this.c.db.run(`UPDATE ${kind} SET name=?,code=?,service_id=? WHERE id=?`, [name, code, service_id, id]);
+        else
+            await this.c.db.insert(kind, item);
+        if (kind === 'lab_tests')
+            await seedPublishedReferences(this.c);
+        await this.c.audit(u, old ? 'UPDATE_' + kind : 'CREATE_' + kind, item.id, '');
+        return item;
+    }
+    async clinic(u, d) {
+        await this.c.admin.check(u, 'clinics', d.remove === true ? 'delete' : d.id || d.restore === true ? 'edit' : 'add');
+        const b = text(d.branch_id, 64);
+        await this.c.branch(u, b);
+        const id = text(d.id, 64), old = id ? await this.c.one('SELECT * FROM clinics WHERE id=?', [id]) : undefined;
+        if (id && (!old || old.branch_id !== b))
+            throw new RuleError('Clinic missing in branch');
+        if (d.remove === true || d.restore === true) {
+            if (!old)
+                throw new RuleError('Select clinic');
+            const active = d.restore === true ? 1 : 0;
+            await this.c.db.run('UPDATE clinics SET active=? WHERE id=?', [active, id]);
+            await this.c.audit(u, active ? 'RESTORE_CLINIC' : 'DELETE_CLINIC', id, b);
+            return { ...old, active };
+        }
+        const name = text(d.name, 200).trim(), specialty_id = text(d.specialty_id, 64), sp = await this.c.one('SELECT * FROM specialties WHERE id=?', [specialty_id]);
+        if (!name || !sp?.active)
+            throw new RuleError('Name and active specialty required / اسم العيادة والتخصص مطلوبان');
+        const item = { id: old?.id || uid(), branch_id: b, name, specialty_id, active: old?.active ?? 1 };
+        if (old)
+            await this.c.db.run('UPDATE clinics SET name=?,specialty_id=? WHERE id=?', [name, specialty_id, id]);
+        else
+            await this.c.db.insert('clinics', item);
+        await this.c.audit(u, old ? 'UPDATE_CLINIC' : 'CREATE_CLINIC', item.id, b);
+        return item;
+    }
+    async assign(u, d) {
+        await this.c.admin.check(u, 'clinics', d.remove === true ? 'delete' : d.id || d.restore === true ? 'edit' : 'add');
+        const b = text(d.branch_id, 64);
+        await this.c.branch(u, b);
+        const id = text(d.id, 64), old = id ? await this.c.one('SELECT * FROM doctor_assignments WHERE id=?', [id]) : undefined;
+        if (id && (!old || old.branch_id !== b))
+            throw new RuleError('Assignment missing');
+        if (d.remove === true || d.restore === true) {
+            if (!old)
+                throw new RuleError('Select assignment');
+            const active = d.restore === true ? 1 : 0;
+            await this.c.db.run('UPDATE doctor_assignments SET active=? WHERE id=?', [active, id]);
+            await this.c.audit(u, active ? 'RESTORE_ASSIGNMENT' : 'DELETE_ASSIGNMENT', id, b);
+            return { ...old, active };
+        }
+        const clinic_id = text(d.clinic_id, 64), doctor_id = text(d.doctor_id, 64), clinic = await this.c.one('SELECT * FROM clinics WHERE id=?', [clinic_id]), doctor = await this.c.one('SELECT * FROM users WHERE id=?', [doctor_id]);
+        if (!clinic?.active || clinic.branch_id !== b || !doctor?.active || doctor.role !== 'doctor' || !await this.c.admin.belongs(doctor, b) || (await this.c.one('SELECT active FROM doctor_profiles WHERE user_id=?', [doctor.id]))?.active === 0)
+            throw new RuleError('Choose an active clinic and doctor in this branch / اختر عيادة وطبيبًا من نفس الفرع');
+        const duplicate = await this.c.one('SELECT * FROM doctor_assignments WHERE clinic_id=? AND doctor_id=? AND active=?', [clinic_id, doctor_id, 1]);
+        if (duplicate && duplicate.id !== id)
+            throw new RuleError('Doctor already assigned to this clinic');
+        if (old && (old.clinic_id !== clinic_id || old.doctor_id !== doctor_id) && await this.c.one('SELECT id FROM appointment_tariffs WHERE assignment_id=?', [id]))
+            throw new RuleError('Clear custom prices before changing the assigned doctor or clinic / ألغ الأسعار المخصصة أولًا قبل تغيير الطبيب أو العيادة');
+        const a = { id: old?.id || uid(), branch_id: b, clinic_id, doctor_id, active: old?.active ?? 1 };
+        if (old)
+            await this.c.db.run('UPDATE doctor_assignments SET clinic_id=?,doctor_id=? WHERE id=?', [clinic_id, doctor_id, id]);
+        else
+            await this.c.db.insert('doctor_assignments', a);
+        await this.c.audit(u, old ? 'UPDATE_ASSIGNMENT' : 'CREATE_ASSIGNMENT', a.id, b);
+        return a;
+    }
+    async book(u, d) {
+        await this.c.admin.check(u, 'bookings', d.remove === true ? 'delete' : d.id || d.restore === true ? 'edit' : 'add');
+        if (['complaint', 'diagnosis', 'diagnosis_id', 'examination', 'treatment', 'prescription', 'prescriptions', 'lab_request', 'lab_orders', 'radiology_request', 'radiology_orders', 'follow_up'].some(k => k in d))
+            throw new RuleError('Clinical fields belong to the doctor screen only / الحقول الطبية خاصة بشاشة الطبيب فقط');
+        const b = text(d.branch_id, 64);
+        await this.c.branch(u, b);
+        const id = text(d.id, 64), old = id ? await this.c.one('SELECT * FROM appointments WHERE id=?', [id]) : undefined;
+        if (id && (!old || old.branch_id !== b || old.status !== 'booked'))
+            throw new RuleError('Only an unstarted booking can be changed / لا يعدل الحجز بعد بدء الكشف');
+        const patient_id = text(d.patient_id, 64), p = await this.c.one('SELECT * FROM patients WHERE id=?', [patient_id]), profile = await this.profile(patient_id);
+        if (!p || profile.deleted_at)
+            throw new RuleError('Patient missing or deleted');
+        const assignment_id = text(d.assignment_id, 64), assignment = await this.c.one('SELECT * FROM doctor_assignments WHERE id=?', [assignment_id]);
+        if (!assignment?.active || assignment.branch_id !== b)
+            throw new RuleError('Choose a doctor assigned to the clinic / اختر طبيبًا مسكنًا في العيادة');
+        const clinic = await this.c.one('SELECT * FROM clinics WHERE id=?', [assignment.clinic_id]), doctor = await this.c.one('SELECT * FROM users WHERE id=?', [assignment.doctor_id]), specialty = clinic ? await this.c.one('SELECT * FROM specialties WHERE id=?', [clinic.specialty_id]) : undefined;
+        if (!clinic?.active || !specialty?.active || !doctor?.active || doctor.role !== 'doctor' || !await this.c.admin.belongs(doctor, b) || (await this.c.one('SELECT active FROM doctor_profiles WHERE user_id=?', [doctor.id]))?.active === 0)
+            throw new RuleError('Clinic, specialty or doctor unavailable');
+        const visit_type = text(d.visit_type, 30);
+        if (!['consultation', 'advice', 'followup', 'other'].includes(visit_type))
+            throw new RuleError('Select visit type / اختر نوع الزيارة');
+        const raw = text(d.scheduled_at, 30);
+        if (!raw || !Number.isFinite(Date.parse(raw)) || !/(Z|[+-]\d{2}:\d{2})$/.test(raw))
+            throw new RuleError('Invalid appointment time');
+        const scheduled_at = new Date(raw).toISOString();
+        const busy = await this.c.one('SELECT * FROM appointments WHERE doctor_id=? AND scheduled_at=? AND status<>?', [doctor.id, scheduled_at, 'cancelled']);
+        if (busy && busy.id !== id)
+            throw new RuleError('Doctor already has a booking at this exact time / للطبيب حجز في نفس الموعد');
+        const display = await this.c.one('SELECT display_name FROM staff_profiles WHERE user_id=?', [doctor.id]);
+        let insurer_name = '', plan_name = '';
+        if (profile.payer_type === 'insurance') {
+            const insurer = await this.c.one('SELECT * FROM insurance_companies WHERE id=?', [profile.insurer_id]), plan = await this.c.one('SELECT * FROM plans WHERE id=?', [profile.plan_id]), r = plan ? JSON.parse(plan.payload) : undefined, day = new Intl.DateTimeFormat('en-CA', { timeZone: 'Africa/Cairo' }).format(new Date(scheduled_at));
+            if (!insurer?.active || !r || r.active === 0 || r.insurer_id !== insurer.id || day < r.valid_from || day > r.valid_to)
+                throw new RuleError('Insurance contract does not cover the booking date / التعاقد غير سارٍ في تاريخ الحجز');
+            insurer_name = insurer.name;
+            plan_name = plan.name;
+        }
+        const tariff = await this.c.pricing.selected(assignment.id, visit_type);
+        if (tariff) {
+            const service = await this.c.one('SELECT s.*,m.active FROM services s JOIN service_details m ON s.id=m.id WHERE s.id=?', [tariff.service_id]);
+            if (!service || service.active === 0)
+                throw new RuleError('Booked service unavailable');
+            if (profile.payer_type === 'insurance') {
+                const plan = (await this.c.one('SELECT * FROM plans WHERE id=?', [profile.plan_id]));
+                const rate = JSON.parse(plan.payload).rates[tariff.service_id];
+                if (rate) {
+                    tariff.contract_price = rate[0];
+                    tariff.patient_bp = rate[1];
+                }
+                if (!rate)
+                    throw new RuleError('Consultation not covered by this insurance contract / خدمة الكشف غير مغطاة بالتعاقد');
+            }
+        }
+        const details = { ...(tariff ? { tariff } : {}), clinic_name: clinic.name, specialty_name: specialty.name, doctor_name: display?.display_name || doctor.username, payer_type: profile.payer_type, insurer_id: profile.insurer_id, insurer_name, plan_id: profile.plan_id, plan_name };
+        const a = { id: old?.id || uid(), branch_id: b, patient_id, clinic_id: clinic.id, doctor_id: doctor.id, assignment_id, visit_type, scheduled_at, status: 'booked', notes: text(d.notes, 2000), details: pack(details), created_by: old?.created_by || u.id, created_at: old?.created_at || now(), started_at: '', completed_at: '' };
+        if (old)
+            await this.c.db.run('UPDATE appointments SET patient_id=?,clinic_id=?,doctor_id=?,assignment_id=?,visit_type=?,scheduled_at=?,notes=?,details=? WHERE id=?', [patient_id, a.clinic_id, a.doctor_id, assignment_id, visit_type, scheduled_at, a.notes, a.details, id]);
+        else
+            await this.c.db.insert('appointments', a);
+        await this.c.audit(u, old ? 'UPDATE_BOOKING' : 'CREATE_BOOKING', a.id, b);
+        return a;
+    }
+    async appointmentAction(u, d) {
+        const a = await this.c.one('SELECT * FROM appointments WHERE id=?', [text(d.id, 64)]);
+        if (!a)
+            throw new RuleError('Booking missing');
+        await this.c.branch(u, a.branch_id);
+        if (d.action === 'cancel') {
+            await this.c.admin.check(u, 'bookings', 'delete');
+            if (a.status !== 'booked')
+                throw new RuleError('Only unstarted bookings may be cancelled / لا يمكن إلغاء حجز بدأ كشفه');
+            await this.c.db.run('UPDATE appointments SET status=? WHERE id=?', ['cancelled', a.id]);
+            await this.c.audit(u, 'CANCEL_BOOKING', a.id, a.branch_id);
+            return { ...a, status: 'cancelled' };
+        }
+        this.c.role(u, 'doctor');
+        if (a.doctor_id !== u.id)
+            throw new RuleError('This booking belongs to another doctor / الحجز يخص طبيبًا آخر');
+        if (d.action !== 'start' || !['booked', 'in_progress'].includes(a.status))
+            throw new RuleError('Booking is not open for examination');
+        if (a.status === 'booked') {
+            await this.c.db.run('UPDATE appointments SET status=?,started_at=? WHERE id=?', ['in_progress', now(), a.id]);
+            await this.c.audit(u, 'START_EXAMINATION', a.id, a.branch_id);
+        }
+        return { ...a, status: 'in_progress' };
+    }
+    async orders(kind, value) { if (value === undefined)
+        return []; if (!Array.isArray(value) || value.length > 100)
+        throw new RuleError('Invalid orders'); const seen = new Set(), result = []; for (const raw of value) {
+        const id = text(raw, 64), item = await this.c.one(`SELECT * FROM ${kind} WHERE id=?`, [id]);
+        if (!item?.active || seen.has(id))
+            throw new RuleError('Invalid or duplicate order / طلب غير صالح أو مكرر');
+        seen.add(id);
+        result.push({ id, name: item.name, service_id: item.service_id });
+    } return result; }
+    async completeVisit(u, d) {
+        this.c.role(u, 'doctor');
+        const a = await this.c.one('SELECT * FROM appointments WHERE id=?', [text(d.appointment_id, 64)]);
+        if (!a)
+            throw new RuleError('Select a booked patient / اختر مريضًا من قائمة حجوزات الطبيب');
+        await this.c.branch(u, a.branch_id);
+        if (a.doctor_id !== u.id || a.status !== 'in_progress')
+            throw new RuleError('Start your assigned booking first / ابدأ كشف الحجز المسند إليك أولًا');
+        if (await this.c.one('SELECT visit_id FROM visit_links WHERE appointment_id=?', [a.id]))
+            throw new RuleError('Examination already saved');
+        const patient = await this.c.one('SELECT * FROM patients WHERE id=?', [a.patient_id]);
+        if (!patient)
+            throw new RuleError('Patient missing');
+        const diagnosis_id = text(d.diagnosis_id, 64), diagnosis = await this.c.one('SELECT * FROM diagnoses WHERE id=?', [diagnosis_id]);
+        if (!text(d.complaint).trim() || !diagnosis?.active)
+            throw new RuleError('Complaint and catalog diagnosis required / الشكوى وتشخيص من القائمة مطلوبان');
+        const prescriptions = [];
+        if (d.prescriptions !== undefined && !Array.isArray(d.prescriptions))
+            throw new RuleError('Invalid prescriptions');
+        if (Array.isArray(d.prescriptions)) {
+            if (d.prescriptions.length > 100)
+                throw new RuleError('Too many prescriptions');
+            for (const raw of d.prescriptions) {
+                if (!raw || typeof raw !== 'object')
+                    throw new RuleError('Invalid medicine');
+                const x = raw, item = await this.c.one('SELECT * FROM medicines WHERE id=?', [text(x.medicine_id, 64)]);
+                if (!item?.active || !text(x.dose, 200).trim() || !text(x.route, 200).trim() || !text(x.frequency, 200).trim() || !text(x.duration, 200).trim())
+                    throw new RuleError('Select medicine and complete dose, route, frequency and duration / اختر الدواء وأكمل الجرعة والطريقة والتكرار والمدة');
+                prescriptions.push({ medicine_id: item.id, name: item.name, strength: text(x.strength, 200), dose: text(x.dose, 200), route: text(x.route, 200), frequency: text(x.frequency, 200), duration: text(x.duration, 200) });
+            }
+        }
+        const lab_orders = await this.orders('lab_tests', d.lab_ids), radiology_orders = await this.orders('radiology_tests', d.radiology_ids);
+        const payload = { patient_name: patient.name, patient_birth_date: patient.birth_date, patient_age_years: ageYears(patient.birth_date), complaint: text(d.complaint), diagnosis: diagnosis.name, diagnosis_id, diagnosis_notes: text(d.diagnosis_notes), examination: text(d.examination), treatment: text(d.treatment), prescription: prescriptions.map(x => `${x.name}\n${x.strength} | ${x.dose} | ${x.route} | ${x.frequency} | ${x.duration}`).join('\n\n'), prescriptions, lab_request: lab_orders.map(x => x.name).join('\n'), lab_orders, radiology_request: radiology_orders.map(x => x.name).join('\n'), radiology_orders, follow_up: text(d.follow_up), allergies: patient.allergies };
+        const v = { id: uid(), branch_id: a.branch_id, patient_id: a.patient_id, doctor_id: u.id, payload: pack(payload), created_at: now() };
+        await this.c.db.insert('visits', v);
+        const link = { visit_id: v.id, appointment_id: a.id, clinic_id: a.clinic_id, visit_type: a.visit_type, details: a.details };
+        await this.c.db.insert('visit_links', link);
+        await this.c.db.run('UPDATE appointments SET status=?,completed_at=? WHERE id=?', ['completed', now(), a.id]);
+        await this.c.serviceWork.create(v);
+        await this.c.audit(u, 'COMPLETE_EXAMINATION', v.id, a.branch_id);
+        return { ...v, link };
+    }
+    async plan(u, d) {
+        await this.c.admin.check(u, 'insurance', d.remove === true ? 'delete' : d.id || d.restore === true ? 'edit' : 'add');
+        const id = text(d.id, 64), old = id ? await this.c.one('SELECT * FROM plans WHERE id=?', [id]) : undefined;
+        if (id && !old)
+            throw new RuleError('Plan missing');
+        if (d.remove === true || d.restore === true) {
+            if (!old)
+                throw new RuleError('Select plan');
+            const rules = JSON.parse(old.payload);
+            rules.active = d.restore === true ? 1 : 0;
+            await this.c.db.run('UPDATE plans SET payload=? WHERE id=?', [pack(rules), id]);
+            await this.c.audit(u, rules.active ? 'RESTORE_PLAN' : 'DELETE_PLAN', id, '');
+            return { ...old, payload: pack(rules) };
+        }
+        const name = text(d.name, 200).trim(), insurer_id = text(d.insurer_id, 64), insurer = await this.c.one('SELECT * FROM insurance_companies WHERE id=?', [insurer_id]), valid_from = text(d.valid_from, 10), valid_to = text(d.valid_to, 10);
+        if (!name || !insurer?.active || !dateValid(valid_from) || !dateValid(valid_to) || valid_from > valid_to || !Array.isArray(d.rates) || !d.rates.length)
+            throw new RuleError('Complete company, dates and service prices / أكمل الشركة والتواريخ وأسعار الخدمات');
+        const rates = {};
+        for (const raw of d.rates) {
+            if (!raw || typeof raw !== 'object')
+                throw new RuleError('Invalid service rate');
+            const row = raw, sid = text(row.service_id, 64);
+            if (rates[sid] || !await this.c.one('SELECT id FROM services WHERE id=?', [sid]))
+                throw new RuleError('Unknown or duplicate service');
+            const price = cents(row.price), bp = cents(row.patient_percent);
+            if (bp > 10000)
+                throw new RuleError('Copayment must be 0–100% / التحمل من صفر إلى ١٠٠٪');
+            rates[sid] = [price, bp];
+        }
+        const p = { id: old?.id || uid(), name, payload: pack({ rates, insurer_id, valid_from, valid_to, active: 1 }) };
+        if (old)
+            await this.c.db.run('UPDATE plans SET name=?,payload=? WHERE id=?', [name, p.payload, id]);
+        else
+            await this.c.db.insert('plans', p);
+        await this.c.audit(u, old ? 'UPDATE_PLAN' : 'CREATE_PLAN', p.id, '');
+        return p;
+    }
+    async decorateSnapshot(u, b, out) {
+        const catalogs = {};
+        for (const kind of catalogKinds)
+            catalogs[kind] = await this.c.db.all(`SELECT * FROM ${kind} ORDER BY name`);
+        out.catalogs = catalogs;
+        out.clinics = await this.c.db.all('SELECT * FROM clinics WHERE branch_id=? ORDER BY name', [b]);
+        out.assignments = await this.c.db.all('SELECT * FROM doctor_assignments WHERE branch_id=?', [b]);
+        out.appointments = u.role !== 'doctor' && (await this.c.admin.access(u)).permissions.bookings.view ? await this.c.db.all('SELECT * FROM appointments WHERE branch_id=? ORDER BY scheduled_at', [b]) : u.role === 'doctor' ? await this.c.db.all('SELECT * FROM appointments WHERE branch_id=? AND doctor_id=? ORDER BY scheduled_at', [b, u.id]) : [];
+        out.doctors = [];
+        for (const doc of await this.c.db.all('SELECT * FROM users WHERE role=? AND active=?', ['doctor', 1])) {
+            const profile = await this.c.one('SELECT active FROM doctor_profiles WHERE user_id=?', [doc.id]);
+            if (await this.c.admin.belongs(doc, b) && profile?.active !== 0)
+                out.doctors.push(await this.c.admin.safe(doc));
+        }
+        const ownProfile = await this.c.one('SELECT display_name FROM staff_profiles WHERE user_id=?', [u.id]);
+        out.user.display_name = ownProfile?.display_name || u.username;
+        if (out.patients.length) {
+            const profiles = new Map((await this.c.db.all('SELECT * FROM patient_profiles')).map(p => [p.patient_id, p]));
+            const merged = [];
+            for (const p of out.patients) {
+                const profile = profiles.get(p.id) || { patient_id: p.id, payer_type: 'normal', insurer_id: '', plan_id: '', referral_source_id: '', referral_notes: '', deleted_at: '' };
+                merged.push({ ...p, ...profile, age_years: ageYears(p.birth_date) });
+            }
+            out.patients = merged.filter(x => !x.deleted_at);
+            out.archived_patients = (await this.c.admin.access(u)).permissions.patients.delete ? merged.filter(x => x.deleted_at) : [];
+            if ((await this.c.admin.access(u)).permissions.billing.view || (await this.c.admin.access(u)).permissions.bookings.view || (await this.c.admin.access(u)).permissions.visits.view)
+                out.patient_names = await this.c.db.all('SELECT id,name FROM patients');
+        }
+        const links = await this.c.db.all('SELECT l.* FROM visit_links l JOIN visits v ON v.id=l.visit_id WHERE v.branch_id=?', [b]);
+        out.visits = out.visits.map(v => ({ ...v, link: links.find(l => l.visit_id === v.id), payload: u.role === 'doctor' ? v.payload : pack({ diagnosis: '' }) }));
+        if (!['admin', 'doctor', 'reception'].includes(u.role) && !(await this.c.admin.access(u)).permissions.catalogs.view && !(await this.c.admin.access(u)).permissions.clinics.view && !(await this.c.admin.access(u)).permissions['external-services'].view && !(await this.c.admin.access(u)).permissions['lab-work'].view && !(await this.c.admin.access(u)).permissions['radiology-work'].view) {
+            out.catalogs = {};
+            for (const k of catalogKinds)
+                out.catalogs[k] = [];
+            out.clinics = [];
+            out.assignments = [];
+        }
+        return out;
+    }
+}

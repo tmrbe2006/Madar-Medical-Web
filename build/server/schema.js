@@ -1,0 +1,36 @@
+export const tables = {
+    access_profiles: 'id VARCHAR(64) PRIMARY KEY, payload TEXT NOT NULL',
+    code_registry: 'id VARCHAR(100) PRIMARY KEY, owner_id VARCHAR(64) NOT NULL',
+    code_sequences: 'id VARCHAR(40) PRIMARY KEY, value BIGINT NOT NULL',
+    service_details: 'id VARCHAR(64) PRIMARY KEY, code VARCHAR(100) NOT NULL UNIQUE, active BIGINT NOT NULL',
+    doctor_profiles: 'id VARCHAR(64) PRIMARY KEY, name VARCHAR(200) NOT NULL, code VARCHAR(100) NOT NULL UNIQUE, specialty_id VARCHAR(64) NOT NULL, phone VARCHAR(40) NOT NULL, user_id VARCHAR(64) NOT NULL UNIQUE, active BIGINT NOT NULL',
+    appointment_tariffs: 'id VARCHAR(64) PRIMARY KEY, assignment_id VARCHAR(64) NOT NULL, visit_type VARCHAR(30) NOT NULL, service_id VARCHAR(64) NOT NULL, price BIGINT NOT NULL, doctor_bp BIGINT NOT NULL',
+    service_requests: 'id VARCHAR(64) PRIMARY KEY, visit_id VARCHAR(64) NOT NULL, branch_id VARCHAR(64) NOT NULL, patient_id VARCHAR(64) NOT NULL, department VARCHAR(30) NOT NULL, catalog_id VARCHAR(64) NOT NULL, name VARCHAR(200) NOT NULL, status VARCHAR(30) NOT NULL, created_at VARCHAR(30) NOT NULL, updated_at VARCHAR(30) NOT NULL, UNIQUE(visit_id,department,catalog_id)',
+    service_results: 'request_id VARCHAR(64) PRIMARY KEY, payload TEXT NOT NULL, status VARCHAR(30) NOT NULL, version BIGINT NOT NULL, entered_by VARCHAR(64) NOT NULL, entered_name VARCHAR(200) NOT NULL, reviewed_by VARCHAR(64) NOT NULL, reviewed_name VARCHAR(200) NOT NULL, review_note TEXT NOT NULL, approved_at VARCHAR(30) NOT NULL, updated_at VARCHAR(30) NOT NULL',
+    exam_definitions: 'id VARCHAR(64) PRIMARY KEY, payload TEXT NOT NULL',
+    request_details: 'id VARCHAR(64) PRIMARY KEY, payload TEXT NOT NULL',
+    result_attachments: 'id VARCHAR(64) PRIMARY KEY, request_id VARCHAR(64) NOT NULL, filename VARCHAR(200) NOT NULL, mime VARCHAR(40) NOT NULL, bytes BIGINT NOT NULL, digest VARCHAR(64) NOT NULL, data LONGTEXT NOT NULL, created_at VARCHAR(30) NOT NULL, created_by VARCHAR(64) NOT NULL, active BIGINT NOT NULL',
+    settings: 'id VARCHAR(64) PRIMARY KEY, payload TEXT NOT NULL',
+    branches: 'id VARCHAR(64) PRIMARY KEY, name VARCHAR(200) NOT NULL, company VARCHAR(200) NOT NULL',
+    users: 'id VARCHAR(64) PRIMARY KEY, username VARCHAR(100) NOT NULL UNIQUE, password VARCHAR(300) NOT NULL, role VARCHAR(30) NOT NULL, branch_id VARCHAR(64) NOT NULL, active BIGINT NOT NULL',
+    patients: 'id VARCHAR(64) PRIMARY KEY, name VARCHAR(200) NOT NULL, phone VARCHAR(40) NOT NULL, birth_date VARCHAR(10) NOT NULL, allergies TEXT NOT NULL, created_at VARCHAR(30) NOT NULL',
+    services: 'id VARCHAR(64) PRIMARY KEY, name VARCHAR(200) NOT NULL, category VARCHAR(30) NOT NULL, price BIGINT NOT NULL, doctor_bp BIGINT NOT NULL',
+    plans: 'id VARCHAR(64) PRIMARY KEY, name VARCHAR(200) NOT NULL, payload TEXT NOT NULL',
+    visits: 'id VARCHAR(64) PRIMARY KEY, branch_id VARCHAR(64) NOT NULL, patient_id VARCHAR(64) NOT NULL, doctor_id VARCHAR(64) NOT NULL, payload TEXT NOT NULL, created_at VARCHAR(30) NOT NULL',
+    documents: 'id VARCHAR(64) PRIMARY KEY, branch_id VARCHAR(64) NOT NULL, kind VARCHAR(30) NOT NULL, party VARCHAR(200) NOT NULL, visit_id VARCHAR(64) NOT NULL, payload TEXT NOT NULL, total BIGINT NOT NULL, patient_due BIGINT NOT NULL, insurer_due BIGINT NOT NULL, doctor_due BIGINT NOT NULL, status VARCHAR(30) NOT NULL, created_at VARCHAR(30) NOT NULL',
+    accounts: 'id VARCHAR(64) PRIMARY KEY, name VARCHAR(200) NOT NULL, category VARCHAR(30) NOT NULL, parent_id VARCHAR(64) NOT NULL, postable BIGINT NOT NULL',
+    journals: 'id VARCHAR(64) PRIMARY KEY, branch_id VARCHAR(64) NOT NULL, source_id VARCHAR(64) NOT NULL, memo VARCHAR(400) NOT NULL, created_at VARCHAR(30) NOT NULL',
+    journal_lines: 'id VARCHAR(64) PRIMARY KEY, journal_id VARCHAR(64) NOT NULL, account_id VARCHAR(64) NOT NULL, debit BIGINT NOT NULL, credit BIGINT NOT NULL, party VARCHAR(200) NOT NULL',
+    payments: 'id VARCHAR(64) PRIMARY KEY, document_id VARCHAR(64) NOT NULL, branch_id VARCHAR(64) NOT NULL, payer VARCHAR(30) NOT NULL, amount BIGINT NOT NULL, created_at VARCHAR(30) NOT NULL',
+    audit: 'id VARCHAR(64) PRIMARY KEY, user_id VARCHAR(64) NOT NULL, action VARCHAR(100) NOT NULL, entity_id VARCHAR(64) NOT NULL, branch_id VARCHAR(64) NOT NULL, created_at VARCHAR(30) NOT NULL',
+    patient_profiles: 'patient_id VARCHAR(64) PRIMARY KEY, payer_type VARCHAR(30) NOT NULL, insurer_id VARCHAR(64) NOT NULL, plan_id VARCHAR(64) NOT NULL, referral_source_id VARCHAR(64) NOT NULL, referral_notes VARCHAR(400) NOT NULL, deleted_at VARCHAR(30) NOT NULL',
+    clinics: 'id VARCHAR(64) PRIMARY KEY, branch_id VARCHAR(64) NOT NULL, name VARCHAR(200) NOT NULL, specialty_id VARCHAR(64) NOT NULL, active BIGINT NOT NULL',
+    doctor_assignments: 'id VARCHAR(64) PRIMARY KEY, branch_id VARCHAR(64) NOT NULL, clinic_id VARCHAR(64) NOT NULL, doctor_id VARCHAR(64) NOT NULL, active BIGINT NOT NULL',
+    appointments: 'id VARCHAR(64) PRIMARY KEY, branch_id VARCHAR(64) NOT NULL, patient_id VARCHAR(64) NOT NULL, clinic_id VARCHAR(64) NOT NULL, doctor_id VARCHAR(64) NOT NULL, assignment_id VARCHAR(64) NOT NULL, visit_type VARCHAR(30) NOT NULL, scheduled_at VARCHAR(30) NOT NULL, status VARCHAR(30) NOT NULL, notes TEXT NOT NULL, details TEXT NOT NULL, created_by VARCHAR(64) NOT NULL, created_at VARCHAR(30) NOT NULL, started_at VARCHAR(30) NOT NULL, completed_at VARCHAR(30) NOT NULL',
+    visit_links: 'visit_id VARCHAR(64) PRIMARY KEY, appointment_id VARCHAR(64) NOT NULL UNIQUE, clinic_id VARCHAR(64) NOT NULL, visit_type VARCHAR(30) NOT NULL, details TEXT NOT NULL',
+    staff_profiles: 'user_id VARCHAR(64) PRIMARY KEY, display_name VARCHAR(200) NOT NULL',
+    requests: 'id VARCHAR(64) PRIMARY KEY, user_id VARCHAR(64) NOT NULL, fingerprint VARCHAR(64) NOT NULL, payload TEXT NOT NULL'
+};
+for (const table of ['specialties', 'diagnoses', 'medicines', 'lab_tests', 'radiology_tests', 'referral_sources', 'insurance_companies', 'doses', 'routes', 'frequencies', 'durations'])
+    tables[table] = 'id VARCHAR(64) PRIMARY KEY, name VARCHAR(200) NOT NULL, code VARCHAR(100) NOT NULL, active BIGINT NOT NULL, service_id VARCHAR(64) NOT NULL';
+export function schema(engine) { return Object.entries(tables).map(([name, raw]) => { const def = engine === 'mysql' ? raw : raw.replaceAll('LONGTEXT', 'TEXT'); return engine === 'sqlserver' ? `IF OBJECT_ID(N'${name}',N'U') IS NULL CREATE TABLE ${name} (${def.replaceAll('TEXT', 'NVARCHAR(MAX)').replaceAll('VARCHAR(', 'NVARCHAR(').replaceAll('NNVARCHAR', 'NVARCHAR')})` : `CREATE TABLE IF NOT EXISTS ${name} (${def})${engine === 'mysql' ? ' ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci' : ''}`; }); }
